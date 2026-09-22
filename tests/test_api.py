@@ -506,3 +506,311 @@ def test_simulate_is_deterministic(client):
         for _ in range(3)
     ]
     assert responses[0] == responses[1] == responses[2]
+
+
+# ---------------------------------------------------------------------------
+# POST /plans/{id}/gate
+# ---------------------------------------------------------------------------
+
+
+def test_gate_with_no_progress_everything_in_first_wave_executes(client):
+    # BASE_PAYLOAD: [[a], [b, c], [d]]
+    plan = _create_plan(client)
+    r = client.post(f"/plans/{plan['id']}/gate", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["plan_id"] == plan["id"]
+    assert body["wave_count"] == 3
+    # Only wave 1 has no dependencies; later waves wait on unfinished deps.
+    assert body["current_wave"] == 1
+    assert body["executable_services"] == ["a"]
+    blocked = {item["service"]: item for item in body["blocked_services"]}
+    assert set(blocked) == {"b", "c", "d"}
+    assert {reason["code"] for reason in blocked["b"]["reasons"]} == {
+        "dependency_incomplete"
+    }
+    d_codes = {reason["code"] for reason in blocked["d"]["reasons"]}
+    assert d_codes == {"dependency_incomplete"}
+    assert blocked["d"]["wave"] == 3
+    waves = {w["index"]: w for w in body["waves"]}
+    assert waves[1]["executable"] == ["a"]
+    assert waves[2] == {
+        "index": 2,
+        "executable": [],
+        "blocked": ["b", "c"],
+        "completed": [],
+        "failed": [],
+    }
+    assert waves[3]["blocked"] == ["d"]
+    assert body["completed_services"] == []
+    assert body["failed_services"] == []
+
+
+def test_gate_advances_wave_by_wave(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate", json={"completed_services": ["a"]}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["current_wave"] == 2
+    assert body["executable_services"] == ["b", "c"]
+    blocked = {item["service"]: item for item in body["blocked_services"]}
+    assert set(blocked) == {"d"}
+    reason = blocked["d"]["reasons"][0]
+    assert reason["code"] == "dependency_incomplete"
+    assert reason["related_services"] in (["b"], ["c"])
+
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["a", "b", "c"]},
+    )
+    body = r.json()
+    assert body["current_wave"] == 3
+    assert body["executable_services"] == ["d"]
+    assert body["blocked_services"] == []
+
+
+def test_gate_all_completed_has_no_current_wave(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["a", "b", "c", "d"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["current_wave"] is None
+    assert body["executable_services"] == []
+    assert body["blocked_services"] == []
+    assert body["completed_services"] == ["a", "b", "c", "d"]
+    assert all(
+        w["executable"] == [] and w["blocked"] == [] for w in body["waves"]
+    )
+
+
+def test_gate_failed_service_recursively_blocks_downstream(client):
+    # [[a], [b, c], [d]]: 'a' failing blocks b, c and transitively d.
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate", json={"failed_services": ["a"]}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["current_wave"] is None
+    assert body["executable_services"] == []
+    blocked = {item["service"]: item for item in body["blocked_services"]}
+    assert set(blocked) == {"b", "c", "d"}
+
+    for s in ("b", "c"):
+        reason = blocked[s]["reasons"][0]
+        assert reason["code"] == "dependency_failed"
+        assert reason["service"] == s
+        assert reason["related_services"] == ["a"]
+        assert reason["context"]["dependency"] == "a"
+        assert reason["context"]["dependency_status"] == "failed"
+
+    d_reasons = blocked["d"]["reasons"]
+    assert {r["code"] for r in d_reasons} == {"upstream_failure"}
+    d_reason = d_reasons[0]
+    assert d_reason["context"]["failed_roots"] == ["a"]
+    # The directly-blocked prerequisite is named, making the chain localizable.
+    assert d_reason["context"]["dependency"] in ("b", "c")
+    assert "a" in d_reason["related_services"]
+
+
+def test_gate_direct_failure_and_upstream_failure_both_reported(client):
+    # d depends on b and c; b failed -> d gets dependency_failed via b and
+    # upstream_failure via c (c blocked by failed a... build that shape):
+    # use a chain [[a], [b], [c]] where c->b->a and b depends on a.
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [
+            {"service": "b", "depends_on": "a"},
+            {"service": "c", "depends_on": "b"},
+        ],
+        "max_concurrency": 1,
+    }
+    plan = _create_plan(client, payload)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["a"], "failed_services": ["b"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    blocked = {item["service"]: item for item in body["blocked_services"]}
+    assert set(blocked) == {"c"}
+    reason = blocked["c"]["reasons"][0]
+    assert reason["code"] == "dependency_failed"
+    assert reason["context"]["dependency"] == "b"
+    assert body["failed_services"] == ["b"]
+    wave2 = next(w for w in body["waves"] if w["index"] == 2)
+    assert wave2["failed"] == ["b"]
+    assert wave2["blocked"] == []
+
+
+def test_gate_independent_same_wave_service_still_executes(client):
+    # [[a], [b, c], [d]] with b failed and a completed: c shares wave 2 with
+    # b but depends only on a, so c still executes; d is blocked (by b failed
+    # and c unfinished).
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["a"], "failed_services": ["b"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["current_wave"] == 2
+    assert body["executable_services"] == ["c"]
+    blocked = {item["service"]: item for item in body["blocked_services"]}
+    assert set(blocked) == {"d"}
+    codes = sorted(reason["code"] for reason in blocked["d"]["reasons"])
+    assert codes == ["dependency_failed", "dependency_incomplete"]
+    failed_dep = next(
+        reason
+        for reason in blocked["d"]["reasons"]
+        if reason["code"] == "dependency_failed"
+    )
+    assert failed_dep["context"]["dependency"] == "b"
+    wave2 = next(w for w in body["waves"] if w["index"] == 2)
+    assert wave2["executable"] == ["c"]
+    assert wave2["failed"] == ["b"]
+    assert wave2["blocked"] == []
+
+
+def test_gate_unknown_service_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["ghost"]},
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issue = body["issues"][0]
+    assert issue["code"] == "unknown_service"
+    assert issue["constraint"] == "completed_services"
+    assert issue["service"] == "ghost"
+
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"failed_services": ["phantom"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "unknown_service"
+    assert issue["constraint"] == "failed_services"
+    assert issue["service"] == "phantom"
+
+
+def test_gate_service_reported_completed_and_failed_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["a"], "failed_services": ["a"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "service_status_conflict"
+    assert issue["service"] == "a"
+    assert issue["related_services"] == ["a"]
+
+
+def test_gate_duplicate_status_entry_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["a", "a"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "duplicate_service_status"
+    assert issue["constraint"] == "completed_services"
+    assert issue["service"] == "a"
+
+
+def test_gate_completed_with_failed_dependency_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"failed_services": ["a"], "completed_services": ["b"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "completed_with_failed_dependency"
+    assert issue["service"] == "b"
+    assert issue["related_services"] == ["a"]
+    assert issue["context"]["failed_dependencies"] == ["a"]
+
+
+def test_gate_completed_before_dependency_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["b"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "completed_before_dependencies"
+    assert issue["service"] == "b"
+    assert issue["related_services"] == ["a"]
+    assert issue["context"]["unfinished_dependencies"] == ["a"]
+
+
+def test_gate_completed_transitive_failure_is_422(client):
+    # [[a], [b], [c]] chain; a failed, c reported completed -> c's upstream a
+    # failed even though b is unreported.
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [
+            {"service": "b", "depends_on": "a"},
+            {"service": "c", "depends_on": "b"},
+        ],
+        "max_concurrency": 1,
+    }
+    plan = _create_plan(client, payload)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"failed_services": ["a"], "completed_services": ["c"]},
+    )
+    assert r.status_code == 422
+    codes = {i["code"] for i in r.json()["issues"]}
+    assert codes == {"completed_with_failed_dependency"}
+
+
+def test_gate_missing_plan_is_404(client):
+    r = client.post("/plans/9999/gate", json={})
+    assert r.status_code == 404
+    assert r.json()["error"] == "not_found"
+
+
+def test_gate_blank_service_id_is_validation_error(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate", json={"completed_services": ["  "]}
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "validation_error"
+    assert body["issues"][0]["code"] == "invalid_request_field"
+    assert body["issues"][0]["constraint"] == "completed_services"
+
+
+def test_gate_does_not_modify_stored_plan(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate", json={"failed_services": ["a"]}
+    )
+    assert r.status_code == 200
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert fetched["wave_count"] == plan["wave_count"]
+
+
+def test_gate_is_deterministic(client):
+    plan = _create_plan(client)
+    payload = {"completed_services": ["a"], "failed_services": ["b"]}
+    responses = [
+        client.post(f"/plans/{plan['id']}/gate", json=payload).json()
+        for _ in range(3)
+    ]
+    assert responses[0] == responses[1] == responses[2]

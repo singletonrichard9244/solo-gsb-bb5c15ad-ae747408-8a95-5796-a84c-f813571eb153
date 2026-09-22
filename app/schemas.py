@@ -93,7 +93,6 @@ class PlanSimulate(BaseModel):
     stored ``max_waves`` window is not applied: the simulation reports the
     resulting wave-count delta instead.
     """
-
     max_concurrency: int | None = Field(
         default=None,
         ge=1,
@@ -112,6 +111,28 @@ class PlanSimulate(BaseModel):
         cleaned = [v.strip() for v in values]
         if any(not v for v in cleaned):
             raise ValueError("domain id must not be blank")
+        return cleaned
+
+
+class GateRequest(BaseModel):
+    """Execution progress reported against a stored plan.
+
+    ``completed_services`` have already finished successfully and
+    ``failed_services`` have failed in this rollout. The gate decides which
+    of the remaining services can still be executed and which are blocked,
+    strictly following the stored wave assignment — the plan itself is never
+    modified.
+    """
+
+    completed_services: list[str] = Field(default_factory=list)
+    failed_services: list[str] = Field(default_factory=list)
+
+    @field_validator("completed_services", "failed_services")
+    @classmethod
+    def _strip_service_ids(cls, values: list[str]) -> list[str]:
+        cleaned = [s.strip() for s in values]
+        if any(not s for s in cleaned):
+            raise ValueError("service id must not be blank")
         return cleaned
 
 
@@ -203,6 +224,54 @@ class PlanSimulation(BaseModel):
         ...,
         description="Services directly referenced by newly added constraints, "
         "sorted",
+    )
+
+
+class GateBlockedItem(BaseModel):
+    """A not-yet-reported service that cannot be executed right now."""
+
+    service: str
+    wave: int = Field(..., ge=1, description="Wave of the service in the stored plan")
+    reasons: list[Issue] = Field(
+        ..., description="Localizable blocking reasons, one per offending dependency"
+    )
+
+
+class GateWaveStatus(BaseModel):
+    """Per-wave breakdown of the gate decision (stored plan unchanged)."""
+
+    index: int = Field(..., ge=1)
+    executable: list[str] = Field(..., description="Executable members, sorted")
+    blocked: list[str] = Field(..., description="Blocked members, sorted")
+    completed: list[str] = Field(..., description="Reported-success members, sorted")
+    failed: list[str] = Field(..., description="Reported-failed members, sorted")
+
+
+class GateResult(BaseModel):
+    """Outcome of the execution gate for one rollout progress report."""
+
+    plan_id: int
+    name: str | None
+    wave_count: int = Field(..., description="Stored plan wave count (unchanged)")
+    current_wave: int | None = Field(
+        ...,
+        description="Earliest stored wave that still has an executable service; "
+        "null when every service is completed or blocked",
+    )
+    executable_services: list[str] = Field(
+        ...,
+        description="Remaining services whose dependencies are all completed, "
+        "grouped by wave then sorted by service id",
+    )
+    blocked_services: list[GateBlockedItem] = Field(
+        ...,
+        description="Blocked remaining services and their localizable reasons; "
+        "empty when nothing is blocked",
+    )
+    completed_services: list[str] = Field(..., description="Reported successes, sorted")
+    failed_services: list[str] = Field(..., description="Reported failures, sorted")
+    waves: list[GateWaveStatus] = Field(
+        ..., description="Executable/blocked/completed/failed split for every stored wave"
     )
 
 

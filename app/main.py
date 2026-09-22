@@ -12,9 +12,14 @@ from fastapi.responses import JSONResponse
 from . import db
 from .config import Settings, load_settings
 from .errors import PlanningError
+from .gate import evaluate_gate
 from .planner import plan_release, simulate_plan
 from .schemas import (
     ErrorBody,
+    GateBlockedItem,
+    GateRequest,
+    GateResult,
+    GateWaveStatus,
     Issue,
     PlanCreate,
     PlanDeleted,
@@ -38,12 +43,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Release Wave Planning API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Compute the minimum number of ordered release waves for a service "
         "dependency graph under per-wave concurrency caps and fault-domain "
-        "anti-affinity constraints (OR-Tools CP-SAT), and simulate the "
-        "impact of constraint changes on a stored plan."
+        "anti-affinity constraints (OR-Tools CP-SAT), simulate the "
+        "impact of constraint changes on a stored plan, and gate execution "
+        "of a rollout against completed and failed services."
     ),
     lifespan=lifespan,
 )
@@ -75,7 +81,13 @@ async def request_validation_handler(
     for err in exc.errors():
         loc = [str(p) for p in err.get("loc", []) if p not in ("body",)]
         service = None
-        if loc and loc[0] in ("services", "dependencies", "fault_domains"):
+        if loc and loc[0] in (
+            "services",
+            "dependencies",
+            "fault_domains",
+            "completed_services",
+            "failed_services",
+        ):
             service = loc[-1] if loc[-1].isidentifier() or "-" in loc[-1] else None
         issues.append(
             Issue(
@@ -290,4 +302,64 @@ def simulate_plan_changes(
         assignments=assignments,
         moved_services=[a.service for a in assignments if a.from_wave != a.to_wave],
         affected_services=result.affected_services,
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/gate",
+    response_model=GateResult,
+    tags=["plans"],
+    responses={404: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def gate_plan_execution(
+    plan_id: int,
+    payload: GateRequest,
+    conn: sqlite3.Connection = Depends(db.get_db),
+) -> GateResult:
+    """Gate rollout execution against reported progress.
+
+    The stored wave assignment and dependency graph are used as-is (they are
+    never modified): services still pending are classified wave by wave into
+    executable vs. blocked, with a localizable reason per failed,
+    upstream-failed or unfinished dependency.
+    """
+    row = db.fetch_plan(conn, plan_id)
+    if row is None:
+        return _plan_not_found(plan_id)  # type: ignore[return-value]
+
+    stored = json.loads(row["result_json"])
+    services = list(stored["services"])
+    wave_of = {
+        service: wave["index"]
+        for wave in stored["waves"]
+        for service in wave["services"]
+    }
+    edges = [(d["service"], d["depends_on"]) for d in stored["dependencies"]]
+
+    output = evaluate_gate(services, wave_of, edges, payload)
+
+    return GateResult(
+        plan_id=row["id"],
+        name=row["name"],
+        wave_count=row["wave_count"],
+        current_wave=output.current_wave,
+        executable_services=output.executable,
+        blocked_services=[
+            GateBlockedItem(
+                service=item.service, wave=item.wave, reasons=item.reasons
+            )
+            for item in output.blocked
+        ],
+        completed_services=output.completed,
+        failed_services=output.failed,
+        waves=[
+            GateWaveStatus(
+                index=wave.index,
+                executable=wave.executable,
+                blocked=wave.blocked,
+                completed=wave.completed,
+                failed=wave.failed,
+            )
+            for wave in output.waves
+        ],
     )

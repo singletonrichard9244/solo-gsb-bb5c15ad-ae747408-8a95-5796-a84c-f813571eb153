@@ -4,7 +4,9 @@
 服务依赖图、每波并发上限以及不能同波发布的故障域，服务给出**顺序确定、波次最少**
 的发布方案；依赖成环或在给定发布窗口内无法排入时，返回**可定位到具体服务与约束**
 的结构化原因。方案持久化到 SQLite，支持查询与删除；`POST /plans/{id}/simulate`
-可在不落库的前提下模拟约束变更对方案的影响。容器启动时自动安装依赖并建表。
+可在不落库的前提下模拟约束变更对方案的影响；`POST /plans/{id}/gate` 基于已存储的
+（不可变）波次方案做发布执行门禁，上报已完成与执行失败的服务后，逐波给出可执行
+服务、阻塞服务及可定位原因。容器启动时自动安装依赖并建表。
 
 ## 一条命令启动
 
@@ -24,6 +26,16 @@ docker compose up --build -d
 停止并保留数据：`docker compose down`；连同数据卷一起清除：`docker compose down -v`。
 
 > 端口可通过环境变量调整：`PLANNER_PORT=9000 docker compose up --build -d`。
+
+容器启动后门禁接口即随服务一起可用（无需额外组件或迁移，数据落在 `planner-data`
+命名卷）。快速体验：先 `POST /plans` 建一个方案记下返回的 `id`，再把当前发布
+进度发给门禁：
+
+```bash
+curl -X POST http://localhost:8000/plans/<id>/gate \
+  -H 'Content-Type: application/json' \
+  -d '{"completed_services": ["svc-a"], "failed_services": []}'
+```
 
 ## 请求示例
 
@@ -55,9 +67,9 @@ curl -X POST http://localhost:8000/plans \
   "name": "payment-platform",
   "waves": [
     {"index": 1, "services": ["db"]},
-    {"index": 2, "services": ["auth", "cache"]},
+    {"index": 2, "services": ["auth"]},
     {"index": 3, "services": ["api"]},
-    {"index": 4, "services": ["web"]}
+    {"index": 4, "services": ["cache", "web"]}
   ],
   "wave_count": 4,
   "max_concurrency": 2,
@@ -148,6 +160,103 @@ curl -X POST http://localhost:8000/plans/1/simulate \
 引用未知服务（`unknown_dependency_*` / `unknown_fault_domain_member`）、
 删除不存在的约束等，均可定位到具体服务与约束。
 
+## 执行门禁（POST /plans/{id}/gate）
+
+发布过程中持续上报本方案内**已完成**与**执行失败**的服务，门禁严格按照**已存储的
+波次方案与依赖图**（不会被门禁修改、不会重排）逐波判定剩余服务：
+
+- 所有直接依赖均已完成 → **可执行**；
+- 否则**阻塞**，并为每个有问题的依赖给出一条可定位原因；
+- 失败沿「依赖于」边**向下游递归传播**：直接依赖失败为 `dependency_failed`，
+  依赖被更上游的失败阻塞为 `upstream_failure`（context 中给出失败根因），
+  依赖既未失败也未完成为 `dependency_incomplete`。
+
+```bash
+curl -X POST http://localhost:8000/plans/1/gate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "completed_services": ["db"],
+    "failed_services": ["cache"]
+  }'
+```
+
+（承接上面 `payment-platform` 示例：存储波次为 `[db] → [auth] → [api] → [cache, web]`，
+门禁不会改变它。）
+
+响应：
+
+```json
+{
+  "plan_id": 1,
+  "name": "payment-platform",
+  "wave_count": 4,
+  "current_wave": 2,
+  "executable_services": ["auth"],
+  "blocked_services": [
+    {
+      "service": "api",
+      "wave": 3,
+      "reasons": [
+        {
+          "code": "dependency_incomplete",
+          "message": "Service 'api' is blocked because its dependency 'auth' is not completed yet.",
+          "constraint": "dependencies",
+          "service": "api",
+          "related_services": ["auth"],
+          "context": {"dependency": "auth", "dependency_status": "pending", "wave": 3}
+        }
+      ]
+    },
+    {
+      "service": "web",
+      "wave": 4,
+      "reasons": [
+        {
+          "code": "dependency_incomplete",
+          "message": "Service 'web' is blocked because its dependency 'api' is not completed yet.",
+          "constraint": "dependencies",
+          "service": "web",
+          "related_services": ["api"],
+          "context": {"dependency": "api", "dependency_status": "pending", "wave": 4}
+        }
+      ]
+    }
+  ],
+  "completed_services": ["db"],
+  "failed_services": ["cache"],
+  "waves": [
+    {"index": 1, "executable": [], "blocked": [], "completed": ["db"], "failed": []},
+    {"index": 2, "executable": ["auth"], "blocked": [], "completed": [], "failed": []},
+    {"index": 3, "executable": [], "blocked": ["api"], "completed": [], "failed": []},
+    {"index": 4, "executable": [], "blocked": ["web"], "completed": [], "failed": ["cache"]}
+  ]
+}
+```
+
+失败递归传播的例子：`db` 失败后，直接依赖它的 `auth` 以 `dependency_failed`
+阻塞，而 `api`、`web` 即使只间接依赖 `db`，也会以 `upstream_failure` 阻塞，
+其 `context.failed_roots` 给出失败根因 `["db"]`，方便沿链定位。
+
+| 字段 | 含义 |
+| --- | --- |
+| `current_wave` | 仍存在可执行服务的**最早波次**（1 起始）；全部完成或全部阻塞时为 `null` |
+| `executable_services` | 当前可执行的剩余服务：先按存储波次归组、波内按 id 排序（同波服务互不影响） |
+| `blocked_services[].reasons` | 每个阻塞服务对应一条或多条原因，均带 `service` / `related_services` / `context`，可直接定位到出问题的依赖 |
+| `waves` | 存储方案每个波次的可执行/阻塞/已完成/已失败拆分（波次方案本身不变） |
+| `completed_services` / `failed_services` | 回显已排序、去重后的上报状态 |
+
+进度上报本身做一致性校验，冲突时统一返回 **422**（信封同下）：
+
+| issue code | 触发条件 |
+| --- | --- |
+| `unknown_service` | 上报了不属于本方案的服务（区分 `completed_services` / `failed_services`） |
+| `duplicate_service_status` | 同一列表中服务重复出现 |
+| `service_status_conflict` | 同一服务同时上报为完成和失败 |
+| `completed_with_failed_dependency` | 上报完成，但其依赖链上（含跨未上报服务的传递路径）存在失败服务 |
+| `completed_before_dependencies` | 上报完成，但其直接依赖尚未全部完成（与存储的发布顺序矛盾） |
+
+门禁为只读操作，不写库：重复请求得到相同结果（确定性），方案不存在时返回 404。
+
 ## 错误结构（422）
 
 所有失败使用统一信封 `error + message + issues[]`，每个 issue 可定位：
@@ -179,6 +288,9 @@ curl -X POST http://localhost:8000/plans/1/simulate \
 | `fault_domain_anti_affinity` | 故障域反亲和所需的最少波次超过 `max_waves` |
 | `release_window_infeasible` | 组合约束下窗口不可行，附无窗口时所需的确切波次 |
 | `dependency_not_found` / `fault_domain_not_found` | 模拟请求要求删除不存在的依赖/故障域 |
+| `dependency_failed` / `upstream_failure` / `dependency_incomplete` | 门禁阻塞原因：直接依赖失败 / 依赖被上游失败递归阻塞（附失败根因）/ 依赖尚未完成 |
+| `unknown_service` / `duplicate_service_status` / `service_status_conflict` | 门禁上报引用未知服务、状态重复上报或完成/失败状态冲突 |
+| `completed_with_failed_dependency` / `completed_before_dependencies` | 门禁上报的「已完成」与其失败上游或未完成依赖矛盾 |
 | `invalid_request_field` | JSON/Schema 校验失败，附带字段位置 |
 
 ## API 一览
@@ -187,6 +299,7 @@ curl -X POST http://localhost:8000/plans/1/simulate \
 | --- | --- | --- |
 | POST | `/plans` | 提交并生成方案，成功 201，失败 422（结构化原因） |
 | POST | `/plans/{id}/simulate` | 约束变更影响模拟（不落库）：新波次、波次增减、逐服务新旧波次、受影响服务 |
+| POST | `/plans/{id}/gate` | 执行门禁（只读）：上报已完成/失败服务，返回最早可执行波次、可执行与阻塞服务及每项可定位原因；输入冲突统一 422 |
 | GET | `/plans?limit=50&offset=0` | 方案列表（按 id 倒序分页） |
 | GET | `/plans/{id}` | 查询单个方案（含完整波次与原始约束） |
 | DELETE | `/plans/{id}` | 删除方案，成功 200，不存在 404 |
@@ -228,9 +341,10 @@ app/
   errors.py     # 结构化规划异常
   graph.py      # 依赖图：环检测（Tarjan SCC）、关键路径
   planner.py    # CP-SAT 建模、两阶段求解、变更模拟、不可行诊断
+  gate.py       # 执行门禁：逐波可执行判定、失败递归传播、进度一致性校验
   db.py         # SQLite 初始化与 CRUD
   main.py       # FastAPI 路由、启动建表、异常处理
-tests/          # 端到端测试（规划/错误定位/CRUD/确定性）
+tests/          # 端到端测试（规划/错误定位/CRUD/模拟/门禁/确定性）
 Dockerfile
 docker-compose.yml
 requirements.txt

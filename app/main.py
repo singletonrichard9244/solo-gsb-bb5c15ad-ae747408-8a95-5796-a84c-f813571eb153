@@ -12,12 +12,16 @@ from fastapi.responses import JSONResponse
 from . import db
 from .config import Settings, load_settings
 from .errors import PlanningError
+from .gate import evaluate_gate
 from .planner import plan_release, simulate_plan
 from .schemas import (
+    BlockedService,
     ErrorBody,
     Issue,
     PlanCreate,
     PlanDeleted,
+    PlanGate,
+    PlanGateResult,
     PlanList,
     PlanResult,
     PlanSimulate,
@@ -38,12 +42,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Release Wave Planning API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Compute the minimum number of ordered release waves for a service "
         "dependency graph under per-wave concurrency caps and fault-domain "
-        "anti-affinity constraints (OR-Tools CP-SAT), and simulate the "
-        "impact of constraint changes on a stored plan."
+        "anti-affinity constraints (OR-Tools CP-SAT), simulate the "
+        "impact of constraint changes on a stored plan, and gate execution "
+        "of a stored plan against reported progress."
     ),
     lifespan=lifespan,
 )
@@ -290,4 +295,43 @@ def simulate_plan_changes(
         assignments=assignments,
         moved_services=[a.service for a in assignments if a.from_wave != a.to_wave],
         affected_services=result.affected_services,
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/gate",
+    response_model=PlanGateResult,
+    tags=["plans"],
+    responses={404: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def gate_plan_execution(
+    plan_id: int,
+    payload: PlanGate,
+    conn: sqlite3.Connection = Depends(db.get_db),
+) -> PlanGateResult:
+    """Execution gate over the stored plan; read-only, nothing is persisted."""
+    row = db.fetch_plan(conn, plan_id)
+    if row is None:
+        return _plan_not_found(plan_id)  # type: ignore[return-value]
+
+    stored = json.loads(row["result_json"])
+    output = evaluate_gate(
+        stored["services"],
+        [(d["service"], d["depends_on"]) for d in stored["dependencies"]],
+        [wave["services"] for wave in stored["waves"]],
+        payload.completed,
+        payload.failed,
+    )
+    return PlanGateResult(
+        plan_id=row["id"],
+        name=row["name"],
+        wave_count=row["wave_count"],
+        earliest_executable_wave=output.earliest_executable_wave,
+        executable_services=output.executable_services,
+        blocked_services=[
+            BlockedService(service=b.service, wave=b.wave, reasons=b.reasons)
+            for b in output.blocked
+        ],
+        completed_services=sorted(set(payload.completed)),
+        failed_services=sorted(set(payload.failed)),
     )

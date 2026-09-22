@@ -115,6 +115,31 @@ class PlanSimulate(BaseModel):
         return cleaned
 
 
+class PlanGate(BaseModel):
+    """Execution progress reported against a stored plan.
+
+    Services absent from both lists are *pending*. Unknown ids are rejected
+    (422 ``unknown_service``) and a service may not appear in both lists
+    (422 ``conflicting_status``); duplicates within one list are merged
+    silently, mirroring how duplicate dependency edges are handled.
+    """
+
+    completed: list[str] = Field(
+        default_factory=list, description="Services that finished executing"
+    )
+    failed: list[str] = Field(
+        default_factory=list, description="Services whose execution failed"
+    )
+
+    @field_validator("completed", "failed")
+    @classmethod
+    def _strip_service_ids(cls, values: list[str]) -> list[str]:
+        cleaned = [v.strip() for v in values]
+        if any(not v for v in cleaned):
+            raise ValueError("service id must not be blank")
+        return cleaned
+
+
 # ---- Response models -------------------------------------------------------
 
 
@@ -203,6 +228,45 @@ class PlanSimulation(BaseModel):
         ...,
         description="Services directly referenced by newly added constraints, "
         "sorted",
+    )
+
+
+class BlockedService(BaseModel):
+    """A pending service that cannot start, with one reason per blocker."""
+
+    service: str
+    wave: int = Field(..., ge=1, description="1-based wave in the stored plan")
+    reasons: list[Issue] = Field(
+        ..., description="One localizable reason per blocking dependency"
+    )
+
+
+class PlanGateResult(BaseModel):
+    """Execution-gate decision for a stored plan; never persisted."""
+
+    plan_id: int
+    name: str | None
+    wave_count: int
+    earliest_executable_wave: int | None = Field(
+        ...,
+        description="Earliest stored wave containing an executable service; "
+        "null when no pending service can start",
+    )
+    executable_services: list[str] = Field(
+        ...,
+        description="Pending services whose dependencies have all completed, "
+        "sorted by id",
+    )
+    blocked_services: list[BlockedService] = Field(
+        ...,
+        description="Pending services that cannot start yet, ordered by wave "
+        "then service id",
+    )
+    completed_services: list[str] = Field(
+        ..., description="Services reported as completed, sorted"
+    )
+    failed_services: list[str] = Field(
+        ..., description="Services reported as failed, sorted"
     )
 
 

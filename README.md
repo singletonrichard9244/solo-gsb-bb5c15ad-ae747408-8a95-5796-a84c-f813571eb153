@@ -4,7 +4,8 @@
 服务依赖图、每波并发上限以及不能同波发布的故障域，服务给出**顺序确定、波次最少**
 的发布方案；依赖成环或在给定发布窗口内无法排入时，返回**可定位到具体服务与约束**
 的结构化原因。方案持久化到 SQLite，支持查询与删除；`POST /plans/{id}/simulate`
-可在不落库的前提下模拟约束变更对方案的影响。容器启动时自动安装依赖并建表。
+可在不落库的前提下模拟约束变更对方案的影响；`POST /plans/{id}/gate` 按存储方案
+对上报的执行进度做门禁判定（只读，不修改方案）。容器启动时自动安装依赖并建表。
 
 ## 一条命令启动
 
@@ -148,6 +149,86 @@ curl -X POST http://localhost:8000/plans/1/simulate \
 引用未知服务（`unknown_dependency_*` / `unknown_fault_domain_member`）、
 删除不存在的约束等，均可定位到具体服务与约束。
 
+## 执行门禁（POST /plans/{id}/gate）
+
+按**已存储的方案**判断当前哪些服务可以开始执行。客户端上报执行进度（已完成 /
+执行失败的服务），门禁按存储波次逐波评估每个未上报的服务：**所有依赖都已完成
+才可执行**；依赖未完成或依赖失败则阻塞，并给出可定位到具体依赖的原因；失败沿
+依赖链**递归传播**，使全部下游服务阻塞。接口只读，**不会修改已存储的方案**。
+
+```bash
+curl -X POST http://localhost:8000/plans/1/gate \
+  -H 'Content-Type: application/json' \
+  -d '{"completed": ["db"], "failed": ["auth"]}'
+```
+
+响应（对应上文 payment-platform 方案）：
+
+```json
+{
+  "plan_id": 1,
+  "name": "payment-platform",
+  "wave_count": 4,
+  "earliest_executable_wave": 4,
+  "executable_services": ["cache"],
+  "blocked_services": [
+    {
+      "service": "api",
+      "wave": 3,
+      "reasons": [
+        {
+          "code": "dependency_failed",
+          "message": "Service 'api' cannot start: dependency 'auth' failed in wave 2.",
+          "constraint": "dependencies",
+          "service": "api",
+          "related_services": ["auth"],
+          "context": {"wave": 3, "dependency": "auth", "dependency_wave": 2,
+                      "dependency_status": "failed"}
+        }
+      ]
+    },
+    {
+      "service": "web",
+      "wave": 4,
+      "reasons": [
+        {
+          "code": "upstream_failed",
+          "message": "Service 'web' cannot start: dependency 'api' is blocked by failed service(s) auth.",
+          "constraint": "dependencies",
+          "service": "web",
+          "related_services": ["api"],
+          "context": {"wave": 4, "dependency": "api", "dependency_wave": 3,
+                      "dependency_status": "blocked", "root_failed": ["auth"]}
+        }
+      ]
+    }
+  ],
+  "completed_services": ["db"],
+  "failed_services": ["auth"]
+}
+```
+
+判定语义：
+
+- 未出现在 `completed` / `failed` 中的服务视为**待执行（pending）**；已上报的
+  状态按事实采信，已完成/已失败的服务不再参与判定。
+- 待执行服务的所有依赖均已完成 → **可执行**；否则**阻塞**，每个阻塞依赖生成
+  一条原因（复用 `Issue` 结构，`related_services` 指向该依赖）。
+- `completed + failed + executable + blocked` 恰好覆盖方案内全部服务；
+  `earliest_executable_wave` 为含可执行服务的最早波次，无可执行服务时为 `null`。
+
+阻塞原因 code（出现在 200 响应中）：
+
+| code | 含义 |
+| --- | --- |
+| `dependency_failed` | 直接依赖已失败（`related_services` 指出失败的依赖） |
+| `upstream_failed` | 直接依赖被失败递归阻塞（`context.root_failed` 给出根因失败服务） |
+| `dependency_incomplete` | 直接依赖尚未完成（`context.dependency_status` 给出其当前状态） |
+
+输入校验走统一 422 信封：引用方案中不存在的服务 → `unknown_service`
+（`constraint` 为 `completed` 或 `failed`）；同一服务同时出现在两个列表 →
+`conflicting_status`；同一列表内的重复条目静默合并；方案不存在返回 404。
+
 ## 错误结构（422）
 
 所有失败使用统一信封 `error + message + issues[]`，每个 issue 可定位：
@@ -179,6 +260,8 @@ curl -X POST http://localhost:8000/plans/1/simulate \
 | `fault_domain_anti_affinity` | 故障域反亲和所需的最少波次超过 `max_waves` |
 | `release_window_infeasible` | 组合约束下窗口不可行，附无窗口时所需的确切波次 |
 | `dependency_not_found` / `fault_domain_not_found` | 模拟请求要求删除不存在的依赖/故障域 |
+| `unknown_service` | 门禁上报了方案中不存在的服务 |
+| `conflicting_status` | 同一服务同时上报为已完成与已失败 |
 | `invalid_request_field` | JSON/Schema 校验失败，附带字段位置 |
 
 ## API 一览
@@ -187,6 +270,7 @@ curl -X POST http://localhost:8000/plans/1/simulate \
 | --- | --- | --- |
 | POST | `/plans` | 提交并生成方案，成功 201，失败 422（结构化原因） |
 | POST | `/plans/{id}/simulate` | 约束变更影响模拟（不落库）：新波次、波次增减、逐服务新旧波次、受影响服务 |
+| POST | `/plans/{id}/gate` | 执行门禁（只读）：最早可执行波次、可执行服务、阻塞服务及逐项原因 |
 | GET | `/plans?limit=50&offset=0` | 方案列表（按 id 倒序分页） |
 | GET | `/plans/{id}` | 查询单个方案（含完整波次与原始约束） |
 | DELETE | `/plans/{id}` | 删除方案，成功 200，不存在 404 |
@@ -228,9 +312,10 @@ app/
   errors.py     # 结构化规划异常
   graph.py      # 依赖图：环检测（Tarjan SCC）、关键路径
   planner.py    # CP-SAT 建模、两阶段求解、变更模拟、不可行诊断
+  gate.py       # 执行门禁：按存储方案评估可执行/阻塞服务及原因
   db.py         # SQLite 初始化与 CRUD
   main.py       # FastAPI 路由、启动建表、异常处理
-tests/          # 端到端测试（规划/错误定位/CRUD/确定性）
+tests/          # 端到端测试（规划/错误定位/CRUD/模拟/门禁/确定性）
 Dockerfile
 docker-compose.yml
 requirements.txt
